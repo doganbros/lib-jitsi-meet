@@ -192,6 +192,13 @@ export default function TraceablePeerConnection(
     this.remoteUfrag = null;
 
     /**
+     * The DTLS transport object for the PeerConnection.
+     * Note: this assume only one shared transport exists because we bundled
+     *       all streams on the same underlying transport.
+     */
+    this._dtlsTransport = null;
+
+    /**
      * The signaling layer which operates this peer connection.
      * @type {SignalingLayer}
      */
@@ -1684,23 +1691,6 @@ TraceablePeerConnection.prototype._mungeCodecOrder = function(description) {
 };
 
 /**
- * Checks if given track belongs to this peerconnection instance.
- *
- * @param {JitsiLocalTrack|JitsiRemoteTrack} track - The track to be checked.
- * @returns {boolean}
- */
-TraceablePeerConnection.prototype.containsTrack = function(track) {
-    if (track.isLocal()) {
-        return this.localTracks.has(track.rtcId);
-    }
-
-    const participantId = track.getParticipantId();
-    const remoteTracksMap = this.remoteTracks.get(participantId);
-
-    return Boolean(remoteTracksMap && remoteTracksMap.get(track.getType()) === track);
-};
-
-/**
  * Add {@link JitsiLocalTrack} to this TPC.
  * @param {JitsiLocalTrack} track
  * @param {boolean} isInitiator indicates if the endpoint is the offerer.
@@ -2030,9 +2020,14 @@ TraceablePeerConnection.prototype.replaceTrack = function(oldTrack, newTrack) {
             .then(() => {
                 oldTrack && this.localTracks.delete(oldTrack.rtcId);
                 newTrack && this.localTracks.set(newTrack.rtcId, newTrack);
+                const mediaActive = mediaType === MediaType.AUDIO
+                    ? this.audioTransferActive
+                    : this.videoTransferActive;
 
-                if (transceiver) {
-                    // Set the transceiver direction.
+                // Set the transceiver direction only if media is not suspended on the connection. This happens when
+                // the client is using the p2p connection. Transceiver direction is updated when media is resumed on
+                // this connection again.
+                if (transceiver && mediaActive) {
                     transceiver.direction = newTrack ? MediaDirection.SENDRECV : MediaDirection.RECVONLY;
                 }
 
@@ -2111,8 +2106,7 @@ TraceablePeerConnection.prototype.createDataChannel = function(label, opts) {
  * the local description.
  * @private
  */
-TraceablePeerConnection.prototype._ensureSimulcastGroupIsLast = function(
-        localSdp) {
+TraceablePeerConnection.prototype._ensureSimulcastGroupIsLast = function(localSdp) {
     let sdpStr = localSdp.sdp;
 
     const videoStartIndex = sdpStr.indexOf('m=video');
@@ -2291,6 +2285,31 @@ TraceablePeerConnection.prototype._mungeOpus = function(description) {
 };
 
 /**
+ * Sets up the _dtlsTransport object and initializes callbacks for it.
+ */
+TraceablePeerConnection.prototype._initializeDtlsTransport = function() {
+    // We are assuming here that we only have one bundled transport here
+    if (!this.peerconnection.getSenders || this._dtlsTransport) {
+        return;
+    }
+
+    const senders = this.peerconnection.getSenders();
+
+    if (senders.length !== 0 && senders[0].transport) {
+        this._dtlsTransport = senders[0].transport;
+
+        this._dtlsTransport.onerror = error => {
+            logger.error(`${this} DtlsTransport error: ${error}`);
+        };
+
+        this._dtlsTransport.onstatechange = () => {
+            this.trace('dtlsTransport.onstatechange', this._dtlsTransport.state);
+        };
+    }
+};
+
+
+/**
  * Configures the stream encodings depending on the video type and the bitrates configured.
  *
  * @returns {Promise} promise that will be resolved when the operation is successful and rejected otherwise.
@@ -2300,47 +2319,42 @@ TraceablePeerConnection.prototype.configureSenderVideoEncodings = function() {
 };
 
 TraceablePeerConnection.prototype.setLocalDescription = function(description) {
-    let localSdp = description;
+    let localDescription = description;
 
-    this.trace('setLocalDescription::preTransform', dumpSDP(localSdp));
+    this.trace('setLocalDescription::preTransform', dumpSDP(localDescription));
 
     // Munge stereo flag and opusMaxAverageBitrate based on config.js
-    localSdp = this._mungeOpus(localSdp);
+    localDescription = this._mungeOpus(localDescription);
 
     if (!this._usesUnifiedPlan) {
-        localSdp = this._adjustLocalMediaDirection(localSdp);
-        localSdp = this._ensureSimulcastGroupIsLast(localSdp);
-    } else if (!this.isP2P) {
-
-        // if we're using unified plan, transform to it first.
-        localSdp = this.interop.toUnifiedPlan(localSdp);
-        this.trace(
-            'setLocalDescription::postTransform (Unified Plan)',
-            dumpSDP(localSdp));
+        localDescription = this._adjustLocalMediaDirection(localDescription);
+        localDescription = this._ensureSimulcastGroupIsLast(localDescription);
     }
 
     // Munge the order of the codecs based on the preferences set through config.js if we are using SDP munging.
     if (!this._usesTransceiverCodecPreferences) {
-        localSdp = this._mungeCodecOrder(localSdp);
+        localDescription = this._mungeCodecOrder(localDescription);
     }
 
+    this.trace('setLocalDescription::postTransform', dumpSDP(localDescription));
+
     return new Promise((resolve, reject) => {
-        this.peerconnection.setLocalDescription(localSdp)
+        this.peerconnection.setLocalDescription(localDescription)
             .then(() => {
                 this.trace('setLocalDescriptionOnSuccess');
-                const localUfrag = SDPUtil.getUfrag(localSdp.sdp);
+                const localUfrag = SDPUtil.getUfrag(localDescription.sdp);
 
                 if (localUfrag !== this.localUfrag) {
                     this.localUfrag = localUfrag;
-                    this.eventEmitter.emit(
-                        RTCEvents.LOCAL_UFRAG_CHANGED, this, localUfrag);
+                    this.eventEmitter.emit(RTCEvents.LOCAL_UFRAG_CHANGED, this, localUfrag);
                 }
+
+                this._initializeDtlsTransport();
+
                 resolve();
             }, err => {
                 this.trace('setLocalDescriptionOnFailure', err);
-                this.eventEmitter.emit(
-                    RTCEvents.SET_LOCAL_DESCRIPTION_FAILED,
-                    err, this);
+                this.eventEmitter.emit(RTCEvents.SET_LOCAL_DESCRIPTION_FAILED, err, this);
                 reject(err);
             });
     });
@@ -2376,74 +2390,63 @@ TraceablePeerConnection.prototype.setAudioTransferActive = function(active) {
 };
 
 TraceablePeerConnection.prototype.setRemoteDescription = function(description) {
+    let remoteDescription = description;
+
     this.trace('setRemoteDescription::preTransform', dumpSDP(description));
 
-    /* eslint-disable no-param-reassign */
     // Munge stereo flag and opusMaxAverageBitrate based on config.js
-    description = this._mungeOpus(description);
+    remoteDescription = this._mungeOpus(remoteDescription);
 
-    /* eslint-enable no-param-reassign */
+    if (this._usesUnifiedPlan) {
+        // Translate the SDP to Unified plan format first for the jvb case, p2p case will only have 2 m-lines.
+        if (!this.isP2P) {
+            const currentDescription = this.peerconnection.remoteDescription;
 
-    if (!this._usesUnifiedPlan) {
-        // TODO the focus should squeze or explode the remote simulcast
-        if (this.isSimulcastOn()) {
-            // eslint-disable-next-line no-param-reassign
-            description = this.simulcast.mungeRemoteDescription(description, true /* add x-google-conference flag */);
-            this.trace(
-                'setRemoteDescription::postTransform (simulcast)',
-                dumpSDP(description));
+            remoteDescription = this.interop.toUnifiedPlan(remoteDescription, currentDescription);
+            this.trace('setRemoteDescription::postTransform (Unified)', dumpSDP(remoteDescription));
         }
-
-        // eslint-disable-next-line no-param-reassign
-        description = normalizePlanB(description);
-    } else if (!this.isP2P) {
-        const currentDescription = this.peerconnection.remoteDescription;
-
-        // eslint-disable-next-line no-param-reassign
-        description = this.interop.toUnifiedPlan(description, currentDescription);
-        this.trace(
-            'setRemoteDescription::postTransform (Unified)',
-            dumpSDP(description));
-
         if (this.isSimulcastOn()) {
-            // eslint-disable-next-line no-param-reassign
-            description = this.simulcast.mungeRemoteDescription(description);
+            // Implode the simulcast ssrcs so that the remote sdp has only the first ssrc in the SIM group.
+            remoteDescription = this.simulcast.mungeRemoteDescription(remoteDescription);
+            this.trace('setRemoteDescription::postTransform (simulcast)', dumpSDP(remoteDescription));
 
-            // eslint-disable-next-line no-param-reassign
-            description = this.tpcUtils.insertUnifiedPlanSimulcastReceive(description);
-            this.trace(
-                'setRemoteDescription::postTransform (sim receive)',
-                dumpSDP(description));
+            remoteDescription = this.tpcUtils.insertUnifiedPlanSimulcastReceive(remoteDescription);
+            this.trace('setRemoteDescription::postTransform (sim receive)', dumpSDP(remoteDescription));
         }
+        remoteDescription = this.tpcUtils.ensureCorrectOrderOfSsrcs(remoteDescription);
+        this.trace('setRemoteDescription::postTransform (correct ssrc order)', dumpSDP(remoteDescription));
+    } else {
+        if (this.isSimulcastOn()) {
+            // Implode the simulcast ssrcs so that the remote sdp has only the first ssrc in the SIM group.
+            remoteDescription = this.simulcast.mungeRemoteDescription(
+                remoteDescription,
+                true /* add x-google-conference flag */);
+            this.trace('setRemoteDescription::postTransform (simulcast)', dumpSDP(remoteDescription));
+        }
+        remoteDescription = normalizePlanB(remoteDescription);
     }
 
     // Munge the order of the codecs based on the preferences set through config.js.
-    // eslint-disable-next-line no-param-reassign
-    description = this._mungeCodecOrder(description);
-
-    if (this._usesUnifiedPlan) {
-        // eslint-disable-next-line no-param-reassign
-        description = this.tpcUtils.ensureCorrectOrderOfSsrcs(description);
-    }
+    remoteDescription = this._mungeCodecOrder(remoteDescription);
+    this.trace('setRemoteDescription::postTransform (munge codec order)', dumpSDP(remoteDescription));
 
     return new Promise((resolve, reject) => {
-        this.peerconnection.setRemoteDescription(description)
+        this.peerconnection.setRemoteDescription(remoteDescription)
             .then(() => {
                 this.trace('setRemoteDescriptionOnSuccess');
-                const remoteUfrag = SDPUtil.getUfrag(description.sdp);
+                const remoteUfrag = SDPUtil.getUfrag(remoteDescription.sdp);
 
                 if (remoteUfrag !== this.remoteUfrag) {
                     this.remoteUfrag = remoteUfrag;
-                    this.eventEmitter.emit(
-                        RTCEvents.REMOTE_UFRAG_CHANGED, this, remoteUfrag);
+                    this.eventEmitter.emit(RTCEvents.REMOTE_UFRAG_CHANGED, this, remoteUfrag);
                 }
+
+                this._initializeDtlsTransport();
+
                 resolve();
             }, err => {
                 this.trace('setRemoteDescriptionOnFailure', err);
-                this.eventEmitter.emit(
-                    RTCEvents.SET_REMOTE_DESCRIPTION_FAILED,
-                    err,
-                    this);
+                this.eventEmitter.emit(RTCEvents.SET_REMOTE_DESCRIPTION_FAILED, err, this);
                 reject(err);
             });
     });
@@ -2822,6 +2825,13 @@ TraceablePeerConnection.prototype._createOfferOrAnswer = function(
             } else if (capabilities && mimeType) {
                 capabilities = capabilities
                     .filter(caps => caps.mimeType.toLowerCase() !== `${MediaType.VIDEO}/${mimeType}`);
+            }
+
+            // Disable ulpfec on Google Chrome and derivatives because
+            // https://bugs.chromium.org/p/chromium/issues/detail?id=1276427
+            if (browser.isChromiumBased()) {
+                capabilities = capabilities
+                    .filter(caps => caps.mimeType.toLowerCase() !== `${MediaType.VIDEO}/${CodecMimeType.ULPFEC}`);
             }
 
             try {

@@ -29,9 +29,17 @@ export default class BreakoutRooms {
     constructor(room) {
         this.room = room;
 
-        this.room.xmpp.addListener(XMPPEvents.BREAKOUT_ROOMS_EVENT, this._handleMessages.bind(this));
+        this._handleMessages = this._handleMessages.bind(this);
+        this.room.xmpp.addListener(XMPPEvents.BREAKOUT_ROOMS_EVENT, this._handleMessages);
 
         this._rooms = {};
+    }
+
+    /**
+     * Stops listening for events.
+     */
+    dispose() {
+        this.room.xmpp.removeListener(XMPPEvents.BREAKOUT_ROOMS_EVENT, this._handleMessages);
     }
 
     /**
@@ -164,7 +172,7 @@ export default class BreakoutRooms {
             break;
         case BREAKOUT_ROOM_EVENTS.UPDATE: {
             this._rooms = payload.rooms;
-            this.room.eventEmitter.emit(XMPPEvents.BREAKOUT_ROOMS_UPDATED, payload.rooms);
+            this.room.eventEmitter.emit(XMPPEvents.BREAKOUT_ROOMS_UPDATED, payload);
             break;
         }
         }
